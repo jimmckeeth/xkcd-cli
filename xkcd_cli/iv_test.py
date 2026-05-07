@@ -1,4 +1,5 @@
 import io
+import sys
 from typing import Any, Dict, List
 from unittest import mock
 from unittest.mock import Mock, patch
@@ -7,7 +8,7 @@ from pathlib import Path
 from dataclasses import dataclass
 import pytest
 
-from .iv import IV
+from .iv import IV, _HAS_TERMIOS
 
 
 @pytest.mark.parametrize(
@@ -48,30 +49,34 @@ def test_scale_fit(params, expected):
 class IvInitMixin:
     def setUp(self):
         super(IvInitMixin, self).setUp()  # type: ignore
-        patcher = patch("termios.tcgetattr", return_value=[])
-        self.mock_termios_tcgetattr = patcher.start()
-        self.addCleanup(patcher.stop)  # type: ignore
+
+        if _HAS_TERMIOS:
+            patcher = patch("termios.tcgetattr", return_value=[])
+            self.mock_termios_tcgetattr = patcher.start()
+            self.addCleanup(patcher.stop)  # type: ignore
+
+            patcher = patch("sys.stdin.fileno", return_value=1)
+            self.mock_sys_stdin_fileno = patcher.start()
+            self.addCleanup(patcher.stop)  # type: ignore
 
         patcher = patch("atexit.register")
         self.mock_atexit_register = patcher.start()
         self.addCleanup(patcher.stop)  # type: ignore
 
-        patcher = patch("sys.stdin.fileno", return_value=1)
-        self.mock_sys_stdin_fileno = patcher.start()
-        self.addCleanup(patcher.stop)  # type: ignore
-
 
 class TestIvInit(IvInitMixin, unittest.TestCase):
     def test_tty_setup(self):
-        self.mock_termios_tcgetattr.return_value = [123]
+        if _HAS_TERMIOS:
+            self.mock_termios_tcgetattr.return_value = [123]
 
         protocol: Any = "foobar"
         iv = IV(protocol)
 
         self.mock_atexit_register.assert_called_once()
         assert iv.libsixel is None
-        assert iv.stdin_fd == 1
-        assert iv.saved_term == [123]
+        if _HAS_TERMIOS:
+            assert iv.stdin_fd == 1
+            assert iv.saved_term == [123]
 
     def test_unknown_protocol(self):
         protocol: Any = "foobar"
@@ -86,6 +91,7 @@ class TestIvInit(IvInitMixin, unittest.TestCase):
         mock_ap.assert_called_once()
 
 
+@unittest.skipUnless(_HAS_TERMIOS, "Unix-only: uses termios/select")
 class TestTerminalRequest(IvInitMixin, unittest.TestCase):
     @patch("select.select")
     def test_happy_path(
@@ -322,7 +328,7 @@ class TestShowImage(IvInitMixin, unittest.TestCase):
         iv._show_image_bytes(img_data, 1, 1)
 
         iv.sixel_show_file.assert_called_once_with(mock.ANY, 1, 1)
-        assert isinstance(iv.sixel_show_file.call_args[0][0], int)
+        assert isinstance(iv.sixel_show_file.call_args[0][0], str)
 
     def test_sixel_with_png_str(self):
         iv = IV("sixel")
@@ -391,14 +397,14 @@ class TestSixelShowFile(IvInitMixin, unittest.TestCase):
         assert stubEncoder._opts["SIXEL_OPTFLAG_WIDTH"] == "100"
         assert stubEncoder._opts["SIXEL_OPTFLAG_HEIGHT"] == "10"
 
-    @patch("shutil.which")
+    @patch("xkcd_cli.iv._imagemagick_cmd")
     @patch("subprocess.run")
     def test_fallback_imagemagick_convert(
         self,
         mock_subp_run: Mock,
-        mock_shutil_which: Mock,
+        mock_im_cmd: Mock,
     ):
-        mock_shutil_which.return_value = "/usr/bin/convert"
+        mock_im_cmd.return_value = ["convert"]
         fp = self.png_sample.as_posix()
 
         @dataclass
@@ -411,9 +417,9 @@ class TestSixelShowFile(IvInitMixin, unittest.TestCase):
 
         tests: List[TC] = [
             TC(-1, -1, ["convert", fp, "sixel:-"]),
-            TC(100, 10, ["convert", fp, "-geometry", "100x10", "sixel:-"]),
-            TC(100, -1, ["convert", fp, "-geometry", "100x", "sixel:-"]),
-            TC(-1, 10, ["convert", fp, "-geometry", "x10", "sixel:-"]),
+            TC(100, 10, ["convert", fp, "-resize", "100x10", "sixel:-"]),
+            TC(100, -1, ["convert", fp, "-resize", "100x", "sixel:-"]),
+            TC(-1, 10, ["convert", fp, "-resize", "x10", "sixel:-"]),
         ]
 
         @dataclass
@@ -438,12 +444,12 @@ class TestSixelShowFile(IvInitMixin, unittest.TestCase):
             out.seek(0)
             assert out.read() == b"foobar"
 
-    @patch("shutil.which")
+    @patch("xkcd_cli.iv._imagemagick_cmd")
     def test_fallback_failure(
         self,
-        mock_shutil_which: Mock,
+        mock_im_cmd: Mock,
     ):
-        mock_shutil_which.return_value = None
+        mock_im_cmd.return_value = None
 
         fp = self.png_sample.as_posix()
 
@@ -669,3 +675,33 @@ class TestSixelDetection(IvInitMixin, unittest.TestCase):
 
         assert ret == False
         assert iv.sixel == False
+
+
+class TestBackgroundColor(IvInitMixin, unittest.TestCase):
+    def test_dark_background(self):
+        iv = IV("kitty")
+        # 4-digit hex components like Windows Terminal returns
+        iv.terminal_request = Mock(return_value="\x1b]11;rgb:2020/2020/2020\x07")
+
+        assert iv.query_background_color() == (0x20, 0x20, 0x20)
+        assert iv.is_dark_background() is True
+
+    def test_light_background(self):
+        iv = IV("kitty")
+        iv.terminal_request = Mock(return_value="\x1b]11;rgb:ffff/ffff/ffff\x07")
+
+        assert iv.query_background_color() == (0xFF, 0xFF, 0xFF)
+        assert iv.is_dark_background() is False
+
+    def test_two_digit_hex(self):
+        iv = IV("kitty")
+        iv.terminal_request = Mock(return_value="\x1b]11;rgb:1a/1a/1a\x07")
+
+        assert iv.query_background_color() == (0x1A, 0x1A, 0x1A)
+
+    def test_unsupported_terminal(self):
+        iv = IV("kitty")
+        iv.terminal_request = Mock(return_value="")
+
+        assert iv.query_background_color() is None
+        assert iv.is_dark_background() is False

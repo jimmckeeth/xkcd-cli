@@ -1,6 +1,6 @@
 from bs4 import BeautifulSoup, Tag
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from random import randint
 from subprocess import Popen, PIPE
@@ -77,12 +77,28 @@ class Cache:
     def read(cls, path: Path):
         content = json.load(open(path))
         last_updated = datetime.fromisoformat(content["last_updated"])
+        if last_updated.tzinfo is None:
+            last_updated = last_updated.replace(tzinfo=timezone.utc)
         comics = [XkcdComicMeta(**c) for c in content["comics"]]
         return Cache(last_updated=last_updated, comics=comics)
 
     def write(self, path: Path):
         with open(path, "w") as f:
             f.write(json.dumps(asdict(self), default=str))
+
+
+def _invert_image(data: bytes) -> bytes:
+    """Invert image pixel colors, preserving the alpha channel."""
+    from PIL import Image, ImageOps
+    import io as _io
+
+    image = Image.open(_io.BytesIO(data)).convert("RGBA")
+    r, g, b, a = image.split()
+    inverted = ImageOps.invert(Image.merge("RGB", (r, g, b)))
+    result = Image.merge("RGBA", (*inverted.split(), a))
+    buf = _io.BytesIO()
+    result.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def fetch_xkcd_archive() -> List[XkcdComicMeta]:
@@ -162,7 +178,7 @@ def _update_cache_if_outdated(
     cache_timeout.
     """
     cache = Cache.read(cache_filename)
-    if datetime.utcnow() > (cache.last_updated + cache_timeout):
+    if datetime.now(timezone.utc) > (cache.last_updated + cache_timeout):
         # Transparently create cache for the user if the cache is older than the
         # cache timeout.
         cache = _update_cache(cache_filename)
@@ -174,7 +190,7 @@ def _update_cache(cache_filename: Path) -> Cache:
     Updates the cache by fetching all comics from the xkcd archive page and
     updating the cache file on disk.
     """
-    dt = datetime.utcnow()
+    dt = datetime.now(timezone.utc)
     comics = fetch_xkcd_archive()
 
     cache = Cache(last_updated=dt, comics=comics)
@@ -246,6 +262,14 @@ def show(
         readable=True,
         help="Path to the cache file.",
     ),
+    invert: Optional[bool] = typer.Option(
+        None,
+        "--invert/--no-invert",
+        help=(
+            "Invert image colors. When omitted, auto-detected: inverts if the "
+            "terminal background is dark."
+        ),
+    ),
 ):
     """
     Show an individual xkcd comic.
@@ -255,6 +279,17 @@ def show(
         iv = IV("auto")
         if not iv.protocol:
             terminal_graphics = False
+
+    # Resolve invert: auto-detect from terminal background when not explicitly set.
+    should_invert: bool
+    if invert is None:
+        try:
+            _iv = iv if iv is not None else IV(None)
+            should_invert = _iv.is_dark_background()
+        except Exception:
+            should_invert = False
+    else:
+        should_invert = invert
     if cache:
         if not cache_filename.exists():
             # Transparently create cache for the user if cache does not yet exist.
@@ -283,6 +318,13 @@ xkcd upstream.""",
             )
             sys.exit(1)
     else:
+        if fzf_cmd is None or shutil.which(str(fzf_cmd)) is None:
+            typer.echo(
+                "fzf not found. Install fzf or set the FZF_CMD environment variable, "
+                "or use --latest, --random, or --comic-id to select a comic directly.",
+                err=True,
+            )
+            sys.exit(1)
         stdout, _ = choice_fzf(fzf_cmd, comics)
         choice = stdout.decode("UTF-8").strip()
         try:
@@ -298,21 +340,19 @@ xkcd upstream.""",
     wrapped_title = "\n".join(wrap(comic.title, width=TERM_MAX_WIDTH_CHARS))
     typer.echo(typer.style(wrapped_title, bold=True) + f" ({comic.id})")
 
-    # Kitty and the alternative method based on xdg-open would support rendering
-    # images directly from an HTTP endpoint but we find it cleaner to download
-    # the file first and serve it from local disk.
-    with tempfile.TemporaryDirectory() as tempdir:
-        r = requests.get(comic.img_src)
-        r.raise_for_status()
-        tmp_img_path = Path(tempdir, str(comic.id) + ".png", stream=True)
-        with open(tmp_img_path, "wb") as f:
-            for chunk in r:
-                f.write(chunk)
-        if terminal_graphics:
+    r = requests.get(comic.img_src, stream=True)
+    r.raise_for_status()
+    img_data = b"".join(r)
+    if should_invert:
+        img_data = _invert_image(img_data)
+
+    if terminal_graphics:
+        # show_image reads the file synchronously, so a TemporaryDirectory is safe.
+        with tempfile.TemporaryDirectory() as tempdir:
+            tmp_img_path = Path(tempdir, str(comic.id) + ".png")
+            tmp_img_path.write_bytes(img_data)
             assert iv is not None  # safe since iv has been initialized above
-            fitscreen = (
-                width <= 0
-            )  # disable fit to screen if explicit width has been set by user
+            fitscreen = width <= 0
             iv.show_image(
                 str(tmp_img_path),
                 w=width,
@@ -321,12 +361,22 @@ xkcd upstream.""",
                 fitheight=fitscreen,
                 upscale=terminal_scale_up,
             )
-        else:
-            cmd = [
-                "xdg-open",
-                tmp_img_path,
-            ]
-            subprocess.run(cmd, stdout=None, stderr=None)
+    else:
+        # os.startfile / xdg-open are non-blocking, so the file must outlive this
+        # process's cleanup. Use mkstemp so the file persists until the viewer opens it.
+        fd, viewer_path = tempfile.mkstemp(suffix=f"_{comic.id}.png")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(img_data)
+            if sys.platform == "win32":
+                os.startfile(viewer_path)
+                # Leave file for the viewer; Windows temp dir is cleaned up by the OS.
+            else:
+                subprocess.run(["xdg-open", viewer_path], stdout=None, stderr=None)
+                Path(viewer_path).unlink(missing_ok=True)
+        except Exception:
+            Path(viewer_path).unlink(missing_ok=True)
+            raise
     typer.echo("\n".join(wrap(comic.subtext, width=TERM_MAX_WIDTH_CHARS)))
 
 

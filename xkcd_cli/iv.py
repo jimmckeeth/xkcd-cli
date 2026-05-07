@@ -1,16 +1,35 @@
 #!/usr/bin/python3
 import shutil
 import sys
-import termios
 import atexit
-import select
 from base64 import standard_b64encode
 from typing import BinaryIO, Literal, Optional, Set, TextIO, Tuple, Union
 import subprocess
 
+try:
+    import termios
+    import select as _select
+    _HAS_TERMIOS = True
+except ImportError:
+    _HAS_TERMIOS = False
+
 Protocol = Union[
     Literal["iterm"], Literal["kitty"], Literal["kitty+"], Literal["sixel"]
 ]
+
+
+def _imagemagick_cmd() -> Optional[list]:
+    """Return the ImageMagick command, or None if not found.
+
+    Prefer 'magick' (ImageMagick 7 unified CLI) over the deprecated 'convert'
+    alias. On Windows, 'convert' is always skipped because it shadows
+    Windows' built-in convert.exe (FAT-to-NTFS filesystem converter).
+    """
+    if shutil.which("magick"):
+        return ["magick"]
+    if sys.platform != "win32" and shutil.which("convert"):
+        return ["convert"]
+    return None
 
 
 class IV:
@@ -23,8 +42,9 @@ class IV:
 
     def __init__(self, protocol: Optional[Union[Protocol, Literal["auto"]]] = None):
         self.libsixel = None
-        self.stdin_fd = sys.stdin.fileno()
-        self.saved_term = termios.tcgetattr(self.stdin_fd)
+        if _HAS_TERMIOS:
+            self.stdin_fd = sys.stdin.fileno()
+            self.saved_term = termios.tcgetattr(self.stdin_fd)
         atexit.register(self.set_normal_term)
         if protocol == "auto":
             self.auto_protocol()
@@ -72,22 +92,15 @@ class IV:
         else:
             return ow, oh
 
-    # Send and escape sequence and read reply.
     def set_normal_term(self) -> None:  # pragma: no cover
-        """
-        Reset the terminal to normal mode.
-        """
-        termios.tcsetattr(self.stdin_fd, termios.TCSAFLUSH, self.saved_term)
+        if _HAS_TERMIOS:
+            termios.tcsetattr(self.stdin_fd, termios.TCSAFLUSH, self.saved_term)
 
     def set_raw_like_term(self) -> None:  # pragma: no cover
-        """
-        Sets the terminal in raw-like mode (noncanonical mode + nonecho mode).
-
-        See also: https://docs.python.org/3.8/library/termios.html#termios.tcgetattr
-        """
-        new_term = termios.tcgetattr(self.stdin_fd)
-        new_term[3] = new_term[3] & ~termios.ICANON & ~termios.ECHO  # lflags
-        termios.tcsetattr(self.stdin_fd, termios.TCSAFLUSH, new_term)
+        if _HAS_TERMIOS:
+            new_term = termios.tcgetattr(self.stdin_fd)
+            new_term[3] = new_term[3] & ~termios.ICANON & ~termios.ECHO  # lflags
+            termios.tcsetattr(self.stdin_fd, termios.TCSAFLUSH, new_term)
 
     def terminal_request(
         self,
@@ -96,20 +109,25 @@ class IV:
         out: BinaryIO = sys.stdout.buffer,
         in_: TextIO = sys.stdin,
     ) -> str:
-        """
-        In raw-like term, run the `cmd` and read from stdin until the matching
-        `end` character has been found. After executing the command, the command
-        terminal is switched back to normal mode.
-        """
+        if _HAS_TERMIOS:
+            return self._terminal_request_unix(cmd, end, out, in_)
+        else:
+            return self._terminal_request_windows(cmd, end, out)  # pragma: no cover
+
+    def _terminal_request_unix(
+        self,
+        cmd: str,
+        end: str,
+        out: BinaryIO,
+        in_: TextIO,
+    ) -> str:
         try:
             self.set_raw_like_term()
             ret = ""
             out.write(cmd.encode("ascii"))
             out.flush()
             timeout = 0.2  # in seconds
-            dr, _, _ = select.select(
-                [in_], [], [], timeout
-            )  # wait for response on stdin
+            dr, _, _ = _select.select([in_], [], [], timeout)
             if dr != []:
                 while True:
                     c = in_.read(1)
@@ -117,8 +135,65 @@ class IV:
                     if c in end:
                         break
         finally:
-            # ensure to switch back to normal terminal mode
             self.set_normal_term()
+        return ret
+
+    def _terminal_request_windows(  # pragma: no cover
+        self,
+        cmd: str,
+        end: str,
+        out: BinaryIO,
+    ) -> str:
+        import msvcrt
+        import ctypes
+        import ctypes.wintypes
+        import time
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        STD_INPUT_HANDLE = -10
+        STD_OUTPUT_HANDLE = -11
+        ENABLE_LINE_INPUT = 0x0002
+        ENABLE_ECHO_INPUT = 0x0004
+        ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+        in_handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        out_handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+
+        in_mode = ctypes.wintypes.DWORD()
+        out_mode = ctypes.wintypes.DWORD()
+        kernel32.GetConsoleMode(in_handle, ctypes.byref(in_mode))
+        kernel32.GetConsoleMode(out_handle, ctypes.byref(out_mode))
+        saved_in = in_mode.value
+        saved_out = out_mode.value
+
+        try:
+            kernel32.SetConsoleMode(
+                in_handle,
+                (saved_in & ~ENABLE_LINE_INPUT & ~ENABLE_ECHO_INPUT)
+                | ENABLE_VIRTUAL_TERMINAL_INPUT,
+            )
+            kernel32.SetConsoleMode(
+                out_handle,
+                saved_out | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+            )
+            out.write(cmd.encode("ascii"))
+            out.flush()
+
+            ret = ""
+            deadline = time.monotonic() + 0.2
+            while time.monotonic() < deadline:
+                if msvcrt.kbhit():
+                    c = msvcrt.getwch()
+                    ret += c
+                    if c in end:
+                        break
+                else:
+                    time.sleep(0.005)
+        finally:
+            kernel32.SetConsoleMode(in_handle, saved_in)
+            kernel32.SetConsoleMode(out_handle, saved_out)
+
         return ret
 
     # Methods to send show image in various protocols.
@@ -139,7 +214,8 @@ class IV:
         if image.format == "PNG":
             data = standard_b64encode(data)
         else:
-            data = standard_b64encode(image.tobytes())
+            rgb = image.convert("RGB")
+            data = standard_b64encode(rgb.tobytes())
 
         return data, image.format, image.height, image.width
 
@@ -238,12 +314,12 @@ class IV:
             enc.setopt(self.encoder.SIXEL_OPTFLAG_HEIGHT, str(h) if h > 0 else "auto")
             enc.setopt(self.encoder.SIXEL_OPTFLAG_COLORS, "256")
             enc.encode(filename)
-        elif shutil.which("convert") is not None:
-            # Use imagemagick convert command as a fallback to convert to sixel format.
+        elif (_im_cmd := _imagemagick_cmd()) is not None:
+            # Use imagemagick as a fallback to convert to sixel format.
             # See also: https://konfou.xyz/posts/sixel-for-terminal-graphics/
-            command = ["convert", filename]
+            command = _im_cmd + [filename]
             if w > 0 or h > 0:
-                command += ["-geometry", f"{w if w > 0 else ''}x{h if h > 0 else ''}"]
+                command += ["-resize", f"{w if w > 0 else ''}x{h if h > 0 else ''}"]
             command += ["sixel:-"]
             res = subprocess.run(command, stdout=subprocess.PIPE)
             out.write(res.stdout)
@@ -313,7 +389,9 @@ class IV:
                 x, y = im.size
                 nw, nh = IV.scale_fit(w, h, x, y, up=upscale)
                 data = io.BytesIO()
-                im.resize((nw, nh)).save(data, format=im.format)
+                im.resize((nw, nh), resample=Image.Resampling.LANCZOS).save(
+                    data, format=im.format or "PNG"
+                )
                 data.seek(0)
                 data = data.read()
             else:
@@ -332,10 +410,15 @@ class IV:
     ):
         if self.protocol == "sixel":
             import tempfile
+            import os
 
-            file = tempfile.TemporaryFile()
-            file.write(image)
-            self.sixel_show_file(file.name, w, h)
+            fd, tmp_path = tempfile.mkstemp(suffix=".png")
+            try:
+                os.write(fd, image)
+                os.close(fd)
+                self.sixel_show_file(tmp_path, w, h)
+            finally:
+                os.unlink(tmp_path)
         else:
             if self.protocol == "iterm":
                 self.iterm_show_file(image, **params)
@@ -485,3 +568,28 @@ class IV:
             protocol = "sixel"
         self.protocol = protocol
         return protocol
+
+    def query_background_color(self) -> Optional[Tuple[int, int, int]]:
+        """
+        Query the terminal background color via OSC 11.
+        Returns an (r, g, b) tuple with values 0-255, or None if unsupported.
+        """
+        import re
+        # Stop on BEL (\x07) or ESC (start of ST \x1b\\) — whichever comes first.
+        response = self.terminal_request("\x1b]11;?\x07", "\x07\x1b")
+        m = re.search(r"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)", response)
+        if not m:
+            return None
+        components = [int(x, 16) for x in m.groups()]
+        if max(components) > 255:
+            components = [c >> 8 for c in components]
+        return components[0], components[1], components[2]
+
+    def is_dark_background(self) -> bool:
+        """Return True if the terminal background is dark (perceived luminance < 50%)."""
+        bg = self.query_background_color()
+        if bg is None:
+            return False
+        r, g, b = bg
+        luminance = 0.299 * r + 0.587 * g + 0.114 * b
+        return luminance < 128

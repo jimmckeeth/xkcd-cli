@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(poetry run *)",
+      "Bash(where poetry *)",
+      "Bash(python -m poetry --version)",
+      "Bash(py -m poetry --version)",
+      "PowerShell(Get-Command *)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(py *)",
+      "Bash(.venv/Scripts/xkcd show *)"
+    ]
+  }
+}
